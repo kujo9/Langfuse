@@ -5,6 +5,7 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -20,6 +21,8 @@ if __name__ == "__main__" and not runtime.exists():
 
 import agent
 import config
+import observability
+from langfuse import get_client
 
 HERE = Path(__file__).parent
 SERVER = ["uvx", "kubernetes-mcp-server@latest", "--config", "mcp-config.toml"]
@@ -92,16 +95,34 @@ except RuntimeError as error:
     st.error(str(error))
     st.stop()
 
+
+@st.cache_resource
+def start_langfuse():
+    """Check the keys once per Streamlit process, and send buffered traces when it stops."""
+    client = get_client()
+    atexit.register(client.shutdown)
+    try:
+        return client.auth_check()
+    except Exception:
+        return False
+
+
+if not start_langfuse():
+    st.warning("Langfuse is not reachable, so this chat is not traced. See Troubleshooting in the lab guide.")
+
+
 # Each chat is a list of messages. They live in this browser session only,
 # so every engineer sees their own chats and a page refresh clears them.
 if "chats" not in st.session_state:
     st.session_state.chats = [[]]
+    st.session_state.chat_ids = [str(uuid.uuid4())]
     st.session_state.current = 0
 
 
 def new_chat():
     if st.session_state.chats[st.session_state.current]:
         st.session_state.chats.append([])
+        st.session_state.chat_ids.append(str(uuid.uuid4()))
         st.session_state.current = len(st.session_state.chats) - 1
 
 
@@ -109,11 +130,25 @@ def open_chat(index):
     st.session_state.current = index
 
 
+def send_feedback(trace_id):
+    """Runs when a thumb is clicked: 1 is up, 0 is down, None is unclicked."""
+    value = st.session_state[f"feedback-{trace_id}"]
+    if value is not None:
+        observability.score_feedback(trace_id, thumbs_up=value == 1)
+
+
+def feedback(message):
+    if message.get("trace_id"):
+        st.feedback("thumbs", key=f"feedback-{message['trace_id']}", on_change=send_feedback, args=(message["trace_id"],))
+
+
 messages = st.session_state.chats[st.session_state.current]
 
 for message in messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
+        if message["role"] == "assistant":
+            feedback(message)
 
 if not messages:
     st.write("Try one of these:")
@@ -134,13 +169,16 @@ if question:
 
     with st.chat_message("assistant"):
         with st.spinner("Investigating..."):
-            answer, called = asyncio.run(agent.ask(question, messages[:-1]))
+            session_id = st.session_state.chat_ids[st.session_state.current]
+            answer, called, trace_id = asyncio.run(agent.ask(question, messages[:-1], session_id))
 
         if called:
             st.caption("Tools called: " + ", ".join(called))
         st.markdown(answer)
+        message = {"role": "assistant", "content": answer, "trace_id": trace_id}
+        feedback(message)
 
-    messages.append({"role": "assistant", "content": answer})
+    messages.append(message)
 
 # The sidebar holds previous chats and nothing else. It is drawn last so a
 # chat started in this run is already listed.
